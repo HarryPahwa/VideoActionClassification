@@ -4,6 +4,7 @@ import json
 import random
 import traceback
 import argparse
+from pprint import pprint
 from pathlib import Path
 
 import cv2
@@ -90,19 +91,23 @@ def average_histogram(frame, bins):
 
 def extract_all_features(
     data_root,
+    num_files=-1,
     first_frame_pool_size=4,
     num_samples=10,
-    edges_pool_size=10,
+    edge_detection_pool_size=10,
     median_blur=5,
     histogram_num_bins=16,
     random_seed=15
 ):
     all_files = list(glob.glob(f'{data_root}/**/*.avi'))
+    if num_files > -1:
+        all_files = all_files[:num_files]
+
     print(f'Extracting from {len(all_files)} files')
     dirnames = sorted([d for d in os.listdir(data_root) if not d.startswith('.')])
 
     first_frame_feature_dim = (CLIP_WIDTH // first_frame_pool_size) * (CLIP_HEIGHT // first_frame_pool_size)
-    edge_feature_dim = (num_samples * (CLIP_WIDTH // edges_pool_size) * (CLIP_HEIGHT // edges_pool_size))
+    edge_feature_dim = (num_samples * (CLIP_WIDTH // edge_detection_pool_size) * (CLIP_HEIGHT // edge_detection_pool_size))
     histogram_feature_dim = num_samples * histogram_num_bins * 3
     feature_dim = first_frame_feature_dim + edge_feature_dim + histogram_feature_dim 
     
@@ -124,7 +129,7 @@ def extract_all_features(
             sampler = torch.linspace(0, avi_tensor.shape[0] - 1, num_samples).trunc().int().tolist()
 
             first_frame_features = maxpool(to_grayscale(avi_tensor[0].numpy())[:,:,0], first_frame_pool_size)
-            edge_features = extract_edge_features(avi_tensor, num_samples=num_samples, pool_size=edges_pool_size)
+            edge_features = extract_edge_features(avi_tensor, num_samples=num_samples, pool_size=edge_detection_pool_size)
             edge_features[edge_features == 255.] = 1.
             histogram_features = np.concatenate([average_histogram(avi_tensor[sample_ind].numpy(), histogram_num_bins).flatten() for sample_ind in sampler]).flatten()
 
@@ -143,74 +148,70 @@ def extract_all_features(
             if i % 50 == 0:
                 print(f'processed {i} out of {len(all_files)}')
 
-
+    print(f'\n\nErrored on {len(invalids)} files')
+    original_size = len(result)
     result = result[result.sum(dim=-1) != 0]
+    assert len(invalids) + len(result) == original_size
+
     return result, labels, fpaths
 
-def features_to_csvs(features, labels, fpaths, random_seed, data_root, train_list_path, test_list_path, output_csv):
+def features_to_df(features, labels, fpaths, random_seed):
     assert len(features) == len(labels) and len(fpaths) == len(labels)
     df = pd.DataFrame(features.numpy())
 
     df['label'] = df.index.map(lambda i: labels[i])
     df['fpath'] = df.index.map(lambda i: fpaths[i])
-    
-    # df = df[~df['fpath'].isin(invalids)]
+
     df = df.sample(frac=1, random_state=random_seed)
-    
-    train_files, test_files = None, None
-    if train_list_path is not None:
-        with open(train_list_path, 'r') as f:
-            train_files = [f'{data_root}/{path.split()[0]}' for path in f.readlines()]
-    
-    if test_list_path is not None:
-        with open(test_list_path, 'r') as f:
-            test_files = [f"{data_root}/{path.split()[0]}" for path in f.readlines()]
-
-    df['is_train'] = df['fpath'].isin(train_files)
-    df['is_test'] = df['fpath'].isin(test_files)
-    print(df['is_train'].sum())
-    print(df['is_test'].sum())
-    assert (df['is_train'] & df['is_test']).sum() == 0
-    print(len(df))
-
-    print('Saving to csvs...')
-
-    # if train_list_path is not None and test_list_path is not None:
-    df[df['is_train']].drop(['fpath', 'is_train', 'is_test'], axis=1).to_csv('train_' + output_csv, header=False, index=False)
-    df[df['is_test']].drop(['fpath', 'is_train', 'is_test'], axis=1).to_csv('test_' + output_csv, header=False, index=False)
-
-    with open('feature_map.json', 'w+') as f:
-        json.dump({
-            'train_labels': df[df['is_train']]['label'].tolist(),
-            'train_fpaths': df[df['is_train']]['fpath'].tolist(),
-            'test_labels': df[df['is_test']]['label'].tolist(),
-            'test_fpaths': df[df['is_test']]['fpath'].tolist(),
-            'dirnames': sorted([d for d in os.listdir(data_root) if not d.startswith('.')]),
-            # 'invalids': list(invalids)
-        }, f)
-
     return df
 
-def main():
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument('data_root', help="Root of the UCF101 folder containing all avi videos")
-    # parser.add_argument('output_csv', help="Output csv to write features + labels to")
-    # parser.add_argument('train_file_list', help="Output csv to write features + labels to")
-    data_root = '/Users/apdoshi/Downloads/UCF-101'
-    train_list_path = '/Users/apdoshi/Downloads/ucfTrainTestlist/trainlist01.txt'
-    test_list_path = '/Users/apdoshi/Downloads/ucfTrainTestlist/testlist01.txt'
-    output_csv = 'features.csv'
+def save_to_csvs(df, data_root, output_csv_path, splits):
+    split_cols = []
+    for split_path in splits:
+        with open(split_path, 'r') as f:
+            split_files = [f'{data_root}/{path.split()[0]}' for path in f.readlines()]
+            split_col_name = split_path.split('.txt')[0]
+            split_cols.append(split_col_name)
+            df[split_col_name] = df['fpath'].isin(split_files)
+            print(f'{df[split_col_name].sum()} files in split {split_col_name}')
 
-    features, labels, fpaths = extract_all_features(data_root)
-    df = features_to_csvs(features, labels, fpaths, 15, data_root, train_list_path, test_list_path, output_csv)
+    if len(split_cols) == 0:
+        print('No splits given - saving to 1 csv')
+        df.drop(['fpath'] + split_cols, axis=1).to_csv(output_csv_path, header=False, index=False)
+    else:
+        print(f'Saving to {split_cols} _features.csv')
+        for split_col_name in split_cols:
+            df[df[split_col_name]].drop(['fpath'] + split_cols, axis=1).to_csv(f'{split_col_name}_{output_csv_path}', header=False, index=False)
     
+    return [f'{split_col_name}_{output_csv_path}' for split_col_name in split_cols]
+
 
 if __name__ == '__main__':
-    data_root = '/Users/apdoshi/Downloads/UCF-101'
-    train_list_path = '/Users/apdoshi/Downloads/ucfTrainTestlist/trainlist01.txt'
-    test_list_path = '/Users/apdoshi/Downloads/ucfTrainTestlist/testlist01.txt'
-    output_csv = 'features.csv'
+    parser = argparse.ArgumentParser(epilog='\n\nExample call: python extract_features.py /Users/apdoshi/Downloads/UCF-101 --output_path features.csv --splits trainlist01.txt testlist01.txt')
+    parser.add_argument('data_root', help="<Requred> Path to the UCF101 folder containing all avi videos")
+    parser.add_argument('-o', '--output_path', help="Path to the output csv to write features + labels to, will be prepended with splits (e.g. train_, test_) if splits are given", default='features.csv')
+    parser.add_argument('-s','--splits', nargs='+', help='List of train/test split file paths', default=[])
+    parser.add_argument('-n','--num_files', type=int, help='Number of files to featurize. If set to -1 (default), will use all files', default=-1)
+    parser.add_argument('-ffps', '--first_frame_pool_size', type=int, help='Max pool size to use on the first frame', default=4)
+    parser.add_argument('-edps', '--edge_detection_pool_size', type=int, help='Max pool size to use on the edge detected frames', default=10)
+    parser.add_argument('-nf', '--num_samples', type=int, help='Number of frames to sample from video for edge detection and histograms', default=10)
+    parser.add_argument('-blur', '--median_blur', type=int, help='Median blur size to use before applying edge detection', default=5)
+    parser.add_argument('-bins', '--histogram_num_bins', type=int, help='Number of color histogram bins to use', default=16)
+    parser.add_argument('-seed', '--random_seed', type=int, help='Random seed to use for shuffling', default=15)
+    args = parser.parse_args()
 
-    features, labels, fpaths = extract_all_features(data_root)
-    df = features_to_csvs(features, labels, fpaths, 15, data_root, train_list_path, test_list_path, output_csv)
-    
+    pprint(vars(args))
+    print()
+
+    features, labels, fpaths = extract_all_features(
+        args.data_root,
+        num_files=args.num_files,
+        first_frame_pool_size=args.first_frame_pool_size,
+        num_samples=args.num_samples,
+        edge_detection_pool_size=args.edge_detection_pool_size,
+        median_blur=args.median_blur,
+        histogram_num_bins=args.histogram_num_bins,
+        random_seed=args.random_seed
+    )
+    df = features_to_df(features, labels, fpaths, random_seed=args.random_seed)
+    split_csvs = save_to_csvs(df, args.data_root, args.output_path, args.splits)
