@@ -131,7 +131,7 @@ def extract_all_features(
             for frame_iter_ind, frame_ind in enumerate(sampler): 
                 edge_features_result[i,frame_iter_ind * edge_feature_dim:(frame_iter_ind + 1) * edge_feature_dim] = edge_features(
                     avi_tensor[frame_ind],
-                    pool_size=edge_detection_pool_size.flatten(),
+                    pool_size=edge_detection_pool_size,
                     auto_threshold=edge_detection_auto_threshold,
                     sigma=edge_detection_sigma,
                     lower=edge_detection_threshold_lower,
@@ -217,7 +217,6 @@ if __name__ == '__main__':
     parser.add_argument('-eds', '--edge_detection_sigma', type=float, help='Sigma to use when automatically thresholding Canny detector based on median', default=0.33)
     parser.add_argument('-edl', '--edge_detection_threshold_lower', type=int, help='When manually thresholding Canny detector, lower threshold value', default=100)
     parser.add_argument('-edu', '--edge_detection_threshold_upper', type=int, help='When manually thresholding Canny detector, upper threshold value', default=200)
-    parser.add_argument('-edps', '--edge_detection_pool_size', type=int, help='Max pool size to use on the edge detected frames', default=10)
     parser.add_argument('-nf', '--num_samples', type=int, help='Number of frames to sample from video for edge detection and histograms', default=10)
     parser.add_argument('-blur', '--median_blur', type=int, help='Median blur size to use before applying edge detection', default=5)
     parser.add_argument('-bins', '--histogram_num_bins', type=int, help='Number of color histogram bins to use', default=16)
