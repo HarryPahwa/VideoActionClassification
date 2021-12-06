@@ -107,7 +107,7 @@ def extract_all_features(
     print(f'first_frame_feature_dim: {first_frame_feature_dim}')
     print(f'edge_feature_dim: {num_samples} frames * {edge_feature_dim} features per frame = {num_samples * edge_feature_dim}')
     print(f'histogram_feature_dim: {num_samples} frames * {histogram_feature_dim} features per frame= {num_samples * histogram_feature_dim}')
-    print(f'feature_dim: {feature_dim}')
+    print(f'total feature_dim: {feature_dim}')
 
     first_frame_features_result = torch.zeros(n, first_frame_feature_dim, dtype=torch.uint8)
     edge_features_result = torch.zeros(n, num_samples * edge_feature_dim, dtype=torch.uint8)
