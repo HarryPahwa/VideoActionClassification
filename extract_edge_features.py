@@ -13,22 +13,51 @@ import torchvision
 import numpy as np
 import pandas as pd
 
+import pretrained_features
+
+features = [
+    'Color',
+    # 'Texture',
+    'Edges',
+    'PretrainedX3D'
+    'FirstFrame'
+]
+
+def get_hog():
+    winSize = (120,160)
+    blockSize = (10,10)
+    blockStride = (10,10)
+    cellSize = (10,10)
+    nbins = 9
+    derivAperture = 1
+    winSigma = 4.
+    histogramNormType = 0
+    L2HysThreshold = 2.0000000000000001e-01
+    gammaCorrection = 0
+    nlevels = 64
+    hog = cv2.HOGDescriptor(winSize,blockSize,blockStride,cellSize,nbins,derivAperture,winSigma,
+                            histogramNormType,L2HysThreshold,gammaCorrection,nlevels)
+    return hog
+
+def load_model(model_name='slowfast_r50'):
+    # Device on which to run the model
+    # Set to cuda to load on GPU
+    device = "cpu" if not torch.cuda.is_available() else "cuda:0"
+
+    # Pick a pretrained model and load the pretrained weights
+    model = torch.hub.load("facebookresearch/pytorchvideo", model=model_name, pretrained=True)
+
+    # Set to eval mode and move to desired device
+    model = model.to(device)
+    model = model.eval()
+
 MEAN_CLIP_LENGTH = 7.21
 MEAN_FRAMES = int(MEAN_CLIP_LENGTH * 25)
 CLIP_WIDTH = 320
 CLIP_HEIGHT = 240
 
-def get_all_avi(dir_root, video_frames_only=True):
-    data = {}
-    for fpath in glob.glob(f'{dir_root}/**/*.avi'):
-        video_frames, audio_frames, metadata = torchvision.io.read_video(fpath)
-        if video_frames_only:
-            yield video_frames
-        else:
-            yield (video_frames, audio_frames, metadata)
-
 def to_grayscale(img):
-     return np.expand_dims((0.3 * img[:,:,0]) + (0.59 * img[:,:,1]) + (0.11 * img[:,:,2]), -1)
+    return np.expand_dims((0.3 * img[:,:,0]) + (0.59 * img[:,:,1]) + (0.11 * img[:,:,2]), -1)
 
 def maxpool(img, size):
     max_pool = torch.nn.MaxPool2d(size, return_indices=False, ceil_mode=False)
@@ -81,6 +110,9 @@ def color_histogram_features(frame, bins):
 def extract_all_features(
     data_root,
     num_files=-1,
+    ignore_classes=[],
+    use_groupings=[],
+    files_per_class=-1,
     first_frame_pool_size=4,
     num_samples=10,
     edge_detection_pool_size=10,
@@ -92,99 +124,159 @@ def extract_all_features(
     histogram_num_bins=16,
     random_seed=15
 ):
-    all_files = list(glob.glob(f'{data_root}/**/*.avi'))
-    n = num_files if num_files > -1 else len(all_files)
-    all_files = all_files[:n]
+    directories = [d for d in list(Path(data_root).glob('*')) if not d.name.startswith('.')]
 
-    print(f'Extracting from {len(all_files)} files')
-    dirnames = sorted([d for d in os.listdir(data_root) if not d.startswith('.')])
+    n = len(list(glob.glob(f'{data_root}/**/*.avi')))
+    if num_files > -1:
+        n = min(n, num_files)
+    if files_per_class > -1:
+        n = min(n, (files_per_class * len(directories)))
+
+    print(f'Extracting from {n} files')
 
     first_frame_feature_dim = (CLIP_WIDTH // first_frame_pool_size) * (CLIP_HEIGHT // first_frame_pool_size)
     edge_feature_dim = (CLIP_WIDTH // edge_detection_pool_size) * (CLIP_HEIGHT // edge_detection_pool_size)
     histogram_feature_dim = histogram_num_bins * 3
-    feature_dim = first_frame_feature_dim + (num_samples * edge_feature_dim) + (num_samples * histogram_feature_dim)
+    pretrained_feature_dim = 2048
+    hog_feature_dim = 4356
+    total_feature_dim = first_frame_feature_dim + (num_samples * edge_feature_dim) + (num_samples * histogram_feature_dim) + pretrained_feature_dim
     
     print(f'first_frame_feature_dim: {first_frame_feature_dim}')
     print(f'edge_feature_dim: {num_samples} frames * {edge_feature_dim} features per frame = {num_samples * edge_feature_dim}')
     print(f'histogram_feature_dim: {num_samples} frames * {histogram_feature_dim} features per frame= {num_samples * histogram_feature_dim}')
-    print(f'total feature_dim: {feature_dim}')
+    print(f'pretrained_feature_dim: {pretrained_feature_dim}')
+    print(f'total feature_dim: {total_feature_dim}')
 
     first_frame_features_result = torch.zeros(n, first_frame_feature_dim, dtype=torch.uint8)
     edge_features_result = torch.zeros(n, num_samples * edge_feature_dim, dtype=torch.uint8)
     histogram_features_result = torch.zeros(n, num_samples * histogram_feature_dim, dtype=torch.float32)
+    pretrained_features_result = torch.zeros(n, pretrained_feature_dim, dtype=torch.float32)
+    hog_features_result = torch.zeros(n, hog_feature_dim, dtype=torch.float32)
 
     labels = []
     fpaths = []
     invalids = set()
 
-    for i, fpath in enumerate(all_files):
-        try:
-            avi_tensor, _, _ = torchvision.io.read_video(fpath)
-            
-            assert avi_tensor.shape[1] == 240 and avi_tensor.shape[2] == 320
+    model = pretrained_features.get_model()
+    transform = pretrained_features.get_transform()
 
-            # Per-Video features
-            first_frame_features_result[i] = maxpool(to_grayscale(avi_tensor[0].numpy())[:,:,0], first_frame_pool_size).type(torch.uint8).flatten()
-            
-            # Per-Frame features - from num_samples evenly sampled frames across the video
-            sampler = torch.linspace(0, avi_tensor.shape[0] - 1, num_samples).trunc().int().tolist()
-            for frame_iter_ind, frame_ind in enumerate(sampler): 
-                edge_features_result[i,frame_iter_ind * edge_feature_dim:(frame_iter_ind + 1) * edge_feature_dim] = edge_features(
-                    avi_tensor[frame_ind],
-                    pool_size=edge_detection_pool_size,
-                    auto_threshold=edge_detection_auto_threshold,
-                    sigma=edge_detection_sigma,
-                    lower=edge_detection_threshold_lower,
-                    upper=edge_detection_threshold_upper
-                ).flatten()
+    i = 0
+    for directory in directories:
+        currdir = directory.name
+        if currdir in ignore_classes:
+            continue
+        
+        avi_filepaths = list(directory.glob('*.avi'))
+        if files_per_class > -1:
+            avi_filepaths = sorted(avi_filepaths, key=lambda fpath: 1 if 'augmented' in fpath else -1)[:files_per_class]
+
+        for avi_fpath in avi_filepaths:
+            if i == n:
+                break
+            try:
                 
-                histogram_features_result[i,frame_iter_ind * histogram_feature_dim:(frame_iter_ind + 1) * histogram_feature_dim] = color_histogram_features(
-                    avi_tensor[frame_ind],
-                    bins=histogram_num_bins
-                ).flatten()
+                print('UH')
+                print(avi_fpath)
+                avi_tensor, _, _ = torchvision.io.read_video(str(avi_fpath))
+                    
+                assert avi_tensor.shape[1] == 240 and avi_tensor.shape[2] == 320
+                
+                # # Per-Video features
+                # first_frame_features_result[i] = maxpool(to_grayscale(avi_tensor[0].numpy())[:,:,0], first_frame_pool_size).type(torch.uint8).flatten()
+                
+                # Per-Frame features - from num_samples evenly sampled frames across the video
+                sampler = torch.linspace(0, avi_tensor.shape[0] - 1, num_samples).trunc().int().tolist()
+                for frame_iter_ind, frame_ind in enumerate(sampler): 
+                    edge_features_result[i,frame_iter_ind * edge_feature_dim:(frame_iter_ind + 1) * edge_feature_dim] = edge_features(
+                        avi_tensor[frame_ind],
+                        pool_size=edge_detection_pool_size,
+                        auto_threshold=edge_detection_auto_threshold,
+                        sigma=edge_detection_sigma,
+                        lower=edge_detection_threshold_lower,
+                        upper=edge_detection_threshold_upper
+                    ).flatten()
 
-            currdir = Path(fpath).parent.name
-            labels.append(currdir)
-            fpaths.append(fpath)
+                    winStride = (10,10)
+                    padding = (10,10)
+                    locations = ((10,20),)
+                    hist = hog.compute(image,winStride,padding,locations)
+                    hog_features_result[i,frame_iter_ind * hog_feature_dim:(frame_iter_ind + 1) * hog_feature_dim] = hist.flatten()
+                    
+                    histogram_features_result[i,frame_iter_ind * histogram_feature_dim:(frame_iter_ind + 1) * histogram_feature_dim] = color_histogram_features(
+                        avi_tensor[frame_ind],
+                        bins=histogram_num_bins
+                    ).flatten()
 
-        except Exception:
-            print(f'ERROR AT {i} - {fpath}')
-            traceback.print_exc()
-            invalids.add(fpath)
-        finally:
-            if i % 50 == 0:
-                print(f'processed {i} out of {len(all_files)}')
+                # features_path = fpath.with_suffix('.pt')
+                # if not features_path.exists():
+                #     print(i)
+                #     avi_tensor, _, _ = torchvision.io.read_video(fpath)
+
+                #     extracted = pretrained_features.extract(model, transform, [fpath])
+                #     torch.save(extracted, str(features_path))
+                # else:
+                #     extracted = torch.load(str(features_path))
+                # pretrained_features_result[i] = extracted
+
+                labels.append(str(currdir))
+                fpaths.append(str(avi_fpath))
+
+            except Exception:
+                print(f'ERROR AT {i} - {avi_fpath}')
+                traceback.print_exc()
+                invalids.add(str(avi_fpath))
+            finally:
+                i += 1
+                if i % 50 == 0:
+                    print(f'processed {i} out of {n}')
+        if i == n:
+            break
 
     edge_features_result[edge_features_result == 255] = 1
 
     print(f'\nErrored on {len(invalids)} files: {invalids}')
-    original_size = len(first_frame_features_result)
-    nonempty = first_frame_features_result.sum(dim=-1) != 0
-    first_frame_features_result = first_frame_features_result[nonempty]
+
+    original_size = len(edge_features_result)
+    nonempty = edge_features_result.sum(dim=-1) != 0
+    # first_frame_features_result = first_frame_features_result[nonempty]
     edge_features_result = edge_features_result[nonempty]
     histogram_features_result = histogram_features_result[nonempty]
+    hog_features_result = hog_features_result[nonempty]
 
-    assert len(invalids) + len(first_frame_features_result) == original_size
+    # pretrained_features_result = pretrained_features_result[pretrained_features_result.sum(dim=-1) != 0]
 
-    return [first_frame_features_result, edge_features_result, histogram_features_result], labels, fpaths
+    return [
+        # first_frame_features_result,
+        # edge_features_result,
+        hog_features_result,
+        histogram_features_result,
+        # pretrained_features_result
+    ], labels, fpaths
 
 def features_to_df(all_features, labels, fpaths, random_seed):
     
     df = pd.concat([
-        pd.DataFrame(features.numpy())
+        pd.DataFrame(features.detach().numpy())
         for features in all_features
     ], axis=1)
     print(f'{len(df.columns)} features')
 
+    import pdb
+    pdb.set_trace()
     assert len(df) == len(labels) and len(fpaths) == len(labels)
 
     df['label'] = df.index.map(lambda i: labels[i])
     df['fpath'] = df.index.map(lambda i: fpaths[i])
+    df['is_augmented'] = df['fpath'].str.contains('augmented').astype(int)
 
     df = df.sample(frac=1, random_state=random_seed)
     return df
 
-def save_to_csvs(df, data_root, output_csv_path, splits):
+# Video files with the substring 'augmented' will be put into any split with 'train' in them
+def save_to_csvs(df, data_root, output_csv_path, splits, dfs_only=False, train_files_per_class=100, random_seed=15):
+    if not Path(output_csv_path).parent.exists():
+        Path(output_csv_path).parent.mkdir(parents=True)
+
     split_cols = []
     for split_path in splits:
         with open(split_path, 'r') as f:
@@ -192,17 +284,33 @@ def save_to_csvs(df, data_root, output_csv_path, splits):
             split_col_name = split_path.split('.txt')[0]
             split_cols.append(split_col_name)
             df[split_col_name] = df['fpath'].isin(split_files)
-            print(f'{df[split_col_name].sum()} files in split {split_col_name}')
 
+    outputs = []
     if len(split_cols) == 0:
         print('No splits given - saving to 1 csv')
-        df.drop(['fpath'] + split_cols, axis=1).to_csv(output_csv_path, header=False, index=False)
+        df.drop(['fpath', 'is_augmented'] + split_cols, axis=1).to_csv(output_csv_path, header=False, index=False)
+        outputs.append(output_csv_path)
     else:
-        print(f'Saving to {split_cols} _features.csv')
         for split_col_name in split_cols:
-            df[df[split_col_name]].drop(['fpath'] + split_cols, axis=1).to_csv(f'{split_col_name}_{output_csv_path}', header=False, index=False)
+            output_path = Path(output_csv_path).parent / (split_col_name + '_' + Path(output_csv_path).name)
+            filter_index = df[split_col_name]
+            if 'train' in split_col_name:
+                filter_index = filter_index | (df['fpath'].str.contains('augmented'))
+
+            filtered_df = df[filter_index]
+
+            if 'train' in split_col_name and train_files_per_class > -1:
+                filtered_df = filtered_df.sort_values(by='is_augmented', ascending=True).groupby('label').head(train_files_per_class)
+                filtered_df = filtered_df.sample(frac=1, random_state=random_seed)
+            
+            if dfs_only:
+                outputs.append(filtered_df)
+            else:
+                print(f'Saving {len(filtered_df)} rows to {output_path}')    
+                filtered_df.drop(['fpath', 'is_augmented'] + split_cols, axis=1).to_csv(output_path, header=False, index=False)
+                outputs.append((filtered_df, output_path))
     
-    return [f'{split_col_name}_{output_csv_path}' for split_col_name in split_cols]
+    return outputs, split_files
 
 
 if __name__ == '__main__':
@@ -211,6 +319,11 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output_path', help="Path to the output csv to write features + labels to, will be prepended with splits (e.g. train_, test_) if splits are given", default='features.csv')
     parser.add_argument('-s','--splits', nargs='+', help='List of train/test split file paths', default=[])
     parser.add_argument('-n','--num_files', type=int, help='Number of files to featurize. If set to -1 (default), will use all files', default=-1)
+    parser.add_argument('-c','--files_per_class', type=int, help='If more than -1, the number of files to featurize per class.', default=-1)
+    parser.add_argument('-ct','--train_files_per_class', type=int, help='If more than -1, the number of training instances to use per class.', default=100)
+    parser.add_argument('-i','--ignore_classes', nargs='+', help='List of classes to ignore', default=[])
+    parser.add_argument('-g','--use_groupings', nargs='+', help='If set, use only classes from these grouping keys', default=[])
+    parser.add_argument('-df', '--df_only', action='store_true', help='If set, don\'t write features to csv - just return the df')
     parser.add_argument('-ffps', '--first_frame_pool_size', type=int, help='Max pool size to use on the first frame', default=4)
     parser.add_argument('-edps', '--edge_detection_pool_size', type=int, help='Max pool size to use on the edge detected frames', default=10)
     parser.add_argument('-edt', '--edge_detection_threshold_type', type=str, help='Type of thresholding to use. Must be one of \'auto\' or \'manual\'', default='auto')
@@ -232,6 +345,9 @@ if __name__ == '__main__':
     features, labels, fpaths = extract_all_features(
         args.data_root,
         num_files=args.num_files,
+        files_per_class=args.files_per_class,
+        ignore_classes=args.ignore_classes,
+        use_groupings=args.use_groupings,
         first_frame_pool_size=args.first_frame_pool_size,
         num_samples=args.num_samples,
         edge_detection_pool_size=args.edge_detection_pool_size,
@@ -244,4 +360,5 @@ if __name__ == '__main__':
         random_seed=args.random_seed
     )
     df = features_to_df(features, labels, fpaths, random_seed=args.random_seed)
-    split_csvs = save_to_csvs(df, args.data_root, args.output_path, args.splits)
+    outputs = save_to_csvs(df, args.data_root, args.output_path, args.splits, train_files_per_class=args.train_files_per_class, dfs_only=args.df_only, random_seed=args.random_seed)
+    # filtered_df.groupby('label').size()
